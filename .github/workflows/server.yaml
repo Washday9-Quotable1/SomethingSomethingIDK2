@@ -1,0 +1,134 @@
+name: ENC-RUNNER
+'on':
+  push:
+    branches:
+      - server
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/amandaa00/git-atc:test-para
+    outputs:
+      segments: ${{ steps.get-segments.outputs.segments }}
+    steps:
+      - name: Install jq
+        run: |
+          apt-get update
+          apt-get install -y jq
+      - name: Cache files for download
+        id: cache-files
+        uses: actions/cache@v3
+        with:
+          path: /app
+          key: ${{ github.sha }}-download
+      - name: Run download script
+        run: |-
+          cd /app
+          python3 download.py tq49ut${{ secrets.MY_SECRET }}
+      - name: Verify data.json exists
+        run: |
+          if [ ! -f /app/data.json ]; then
+            echo "Error: data.json not found after download"
+            exit 1
+          fi
+          echo "data.json exists with content:"
+          head -5 /app/data.json
+      - name: Upload data.json as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-json
+          path: /app/data.json
+      - name: Get segments
+        id: get-segments
+        run: |
+          SEGMENTS=$(jq -c '.OUTPUT_FILES | keys' /app/data.json)
+          echo "segments=$SEGMENTS" >> $GITHUB_OUTPUT
+  encode:
+    needs: download
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        segment: ${{ fromJson(needs.download.outputs.segments) }}
+    container:
+      image: docker.io/amandaa00/git-atc:test-para
+    steps:
+      - name: Install jq
+        run: |
+          apt-get update
+          apt-get install -y jq
+      - name: Restore download cache (for bulk files)
+        id: restore-cache
+        uses: actions/cache@v3
+        with:
+          path: /app
+          key: ${{ github.sha }}-download
+      - name: Download data.json artifact (reliable backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: data-json
+          path: /app/
+      - name: Verify required files exist
+        run: |
+          cd /app
+          if [ ! -f data.json ]; then
+            echo "Error: data.json not found after restoration"
+            echo "Contents of /app:"
+            ls -la /app/
+            exit 1
+          fi
+          echo "data.json restored successfully"
+      - name: Encode segment
+        run: |
+          cd /app
+          mkdir -p encoded
+          python3 encode.py ${{ matrix.segment }}
+      - name: Save encoded segment
+        uses: actions/upload-artifact@v4
+        with:
+          name: segment-${{ matrix.segment }}
+          path: /app/encoded
+  upload:
+    needs: encode
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/amandaa00/git-atc:test-para
+    steps:
+      - name: Restore download cache (for bulk files)
+        uses: actions/cache@v3
+        with:
+          path: /app
+          key: ${{ github.sha }}-download
+      - name: Download data.json artifact (reliable backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: data-json
+          path: /app/
+      - name: Download all encoded segments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: segment-*
+          path: /app/encoded
+      - name: Extract necessary files and clean up
+        run: |
+          cd /app/encoded
+          for dir in segment-*; do
+            if [ -d "$dir" ]; then
+              mv "$dir"/* .
+              rmdir "$dir"
+            fi
+          done
+          ls -sh
+      - name: Merge and upload files
+        run: |
+          cd /app
+          python3 upload.py
+  delete:
+    needs: upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            data-json
+            segment-*
